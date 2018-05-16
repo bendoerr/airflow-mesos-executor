@@ -184,7 +184,8 @@ class AirflowMesosScheduler(Scheduler):
                     loop = False
 
             # Release any offers we haven't used
-            driver.launchTasks([offer.id for offer in available_offers], [])
+            for offer in available_offers:
+                driver.declineOffer(offer.id)
         except Exception as err:
             logging.error("MesosScheduler.resourceOffers error while running. "
                           "Failing the current task and releasing offers. %s",
