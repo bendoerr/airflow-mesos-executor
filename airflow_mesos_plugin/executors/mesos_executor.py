@@ -6,6 +6,7 @@ import mesos.native
 from airflow.executors import BaseExecutor
 from airflow.executors.base_executor import PARALLELISM
 from mesos.interface import mesos_pb2
+from datetime import datetime, timedelta
 
 from airflow_mesos_plugin.executors.mesos_support.config import config_master_url, \
     config_framework_name, config_framework_checkpoint, \
@@ -31,6 +32,11 @@ class MesosExecutor(BaseExecutor):
         self.credential = None
         self.scheduler = None
         self.driver = None
+
+        self.suppressed = False
+
+        self.reconcile_interval = timedelta(minutes=5)
+        self.reconcile_last = datetime.now()
 
     def start(self):
         self.master = config_master_url()
@@ -65,6 +71,7 @@ class MesosExecutor(BaseExecutor):
         """
         task_instance = self.queued_task_instances.pop(key)
         self.scheduler_tasks.put((key, command, task_instance))
+        self.mesos_suppress_revive()
 
     def end(self):
         """
@@ -85,24 +92,30 @@ class MesosExecutor(BaseExecutor):
         self.driver.stop()
 
     def terminate(self):
-        self.sync()
         self.driver.abort()
 
     def sync_mesos(self):
         # ScheduleDriver.start appears to be idempotent and will just return the
         # current status rather than try to start the driver back up again.
-        # I'd like if there was a better way to check.
         driver_status = self.driver.start()
-        logging.info("SchedulerDriver has status %s",
-                     mesos_pb2.Status.Name(driver_status))
+        if driver_status != mesos_pb2.DRIVER_RUNNING:
+            logging.info("SchedulerDriver has status %s",
+                         mesos_pb2.Status.Name(driver_status))
 
         if driver_status == mesos_pb2.DRIVER_ABORTED:
             logging.info("Trying to restart SchedulerDriver")
             self.start()
+            # Force reconciliation after restart
+            self.scheduler.reconcile(self.driver)
 
         # Ask the Scheduler to reconcile any mesos tasks that is aware of with
         # the mesos master.
-        self.scheduler.reconcile(self.driver)
+        if self.reconcile_last + self.reconcile_interval < datetime.now():
+            self.scheduler.reconcile(self.driver)
+            self.reconcile_last = datetime.now()
+
+        # Update suppress/revive offers status
+        self.mesos_suppress_revive()
 
     def sync_results(self):
         # Grab results from the scheduler and let the Airflow framework know
@@ -110,6 +123,18 @@ class MesosExecutor(BaseExecutor):
         while not self.scheduler_results.empty():
             result = self.scheduler_results.get()
             self.change_state(*result)
+
+    def mesos_suppress_revive(self):
+        if self.scheduler_tasks.empty() and not self.suppressed:
+            logging.info("Suppressing mesos offers.")
+            self.suppressed = True
+            self.driver.suppressOffers()
+
+        if not self.scheduler_tasks.empty() and self.suppressed:
+            logging.info("Reviving mesos offers.")
+            self.suppressed = False
+            self.driver.reviveOffers()
+
 
     def build_framework(self):
         framework = mesos_pb2.FrameworkInfo()
